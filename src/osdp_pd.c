@@ -838,29 +838,29 @@ static int pd_send_reply(struct osdp_pd *pd)
 	int ret, len;
 
 	/* init packet buf with header */
-	len = osdp_phy_packet_init(pd, pd->rx_buf, sizeof(pd->rx_buf));
+	len = osdp_phy_packet_init(pd, pd->data_buf, sizeof(pd->data_buf));
 	if (len < 0) {
 		return -1;
 	}
 
 	/* fill reply data */
-	ret = pd_build_reply(pd, pd->rx_buf, sizeof(pd->rx_buf));
+	ret = pd_build_reply(pd, pd->data_buf, sizeof(pd->data_buf));
 	if (ret <= 0) {
 		return -1;
 	}
 	len += ret;
 
 	/* finalize packet */
-	len = osdp_phy_packet_finalize(pd, pd->rx_buf, len, sizeof(pd->rx_buf));
+	len = osdp_phy_packet_finalize(pd, pd->data_buf, len, sizeof(pd->data_buf));
 	if (len < 0) {
 		return -1;
 	}
 
-	ret = pd->channel.send(pd->channel.data, pd->rx_buf, len);
+	ret = pd->channel.send(pd->channel.data, pd->data_buf, len);
 
 	if (IS_ENABLED(CONFIG_OSDP_PACKET_TRACE)) {
 		if (pd->cmd_id != CMD_POLL) {
-			osdp_dump(pd->rx_buf, pd->rx_buf_len,
+			osdp_dump(pd->data_buf, pd->data_buf_len,
 				  "OSDP: PD[%d]: Sent", pd->address);
 		}
 	}
@@ -879,9 +879,8 @@ static int pd_send_reply(struct osdp_pd *pd)
 static int pd_receve_packet(struct osdp_pd *pd)
 {
 	uint8_t *buf;
-	int rec_bytes, ret, was_empty, max_len;
+	int rec_bytes, ret, max_len;
 
-	was_empty = pd->rx_buf_len == 0;
 	buf = pd->rx_buf + pd->rx_buf_len;
 	max_len = sizeof(pd->rx_buf) - pd->rx_buf_len;
 
@@ -889,7 +888,7 @@ static int pd_receve_packet(struct osdp_pd *pd)
 	if (rec_bytes <= 0) {
 		return 1;
 	}
-	if (was_empty && rec_bytes > 0) {
+	if (pd->tstamp == 0) {
 		/* Start of message */
 		pd->tstamp = osdp_millis_now();
 	}
@@ -917,18 +916,23 @@ static int pd_receve_packet(struct osdp_pd *pd)
 	ret = osdp_phy_decode_packet(pd, pd->rx_buf, pd->rx_buf_len);
 	if (ret == OSDP_ERR_PKT_FMT) {
 		if (pd->reply_id != 0) {
+			pd->tstamp = 0;
 			return -2; /* Send a NAK */
 		}
+		pd->tstamp = 0;
 		return -1; /* fatal errors */
 	} else if (ret == OSDP_ERR_PKT_WAIT) {
-		/* rx_buf_len != pkt->len; wait for more data */
+		/* rx_buf_len < pkt->len; wait for more data */
 		return 1;
 	} else if (ret == OSDP_ERR_PKT_SKIP) {
 		/* soft fail - discard this message */
-		pd->rx_buf_len = 0;
+		pd->tstamp = 0;
 		return 1;
 	}
-	pd->rx_buf_len = ret;
+	/* timestamp of last valid packet */
+	pd->sc_tstamp = osdp_millis_now();
+	pd->tstamp = 0;
+	pd->data_buf_len = ret;
 	return 0;
 }
 
@@ -939,9 +943,11 @@ static void osdp_pd_update(struct osdp_pd *pd)
 	switch (pd->state) {
 	case OSDP_PD_STATE_IDLE:
 		ret = pd_receve_packet(pd);
-		if (ret == -1 || ((pd->rx_buf_len > 0 ||
-		    ISSET_FLAG(pd, PD_FLAG_SC_ACTIVE)) &&
-		    osdp_millis_since(pd->tstamp) > OSDP_RESP_TOUT_MS)) {
+		if (ret == -1 ||
+			 (pd->tstamp != 0 &&
+				osdp_millis_since(pd->tstamp) > OSDP_RESP_TOUT_MS) ||
+			 (ISSET_FLAG(pd, PD_FLAG_SC_ACTIVE) > 0 &&
+				osdp_millis_since(pd->sc_tstamp) > OSDP_RESP_TOUT_MS)) {
 			/**
 			 * When we receive a command from PD after a timeout,
 			 * any established secure channel must be discarded.
@@ -954,7 +960,7 @@ static void osdp_pd_update(struct osdp_pd *pd)
 			break;
 		}
 		if (ret == 0) {
-			pd_decode_command(pd, pd->rx_buf, pd->rx_buf_len);
+			pd_decode_command(pd, pd->data_buf, pd->data_buf_len);
 		}
 		pd->state = OSDP_PD_STATE_SEND_REPLY;
 		/* FALLTHRU */
@@ -963,7 +969,6 @@ static void osdp_pd_update(struct osdp_pd *pd)
 			pd->state = OSDP_PD_STATE_ERR;
 			break;
 		}
-		pd->rx_buf_len = 0;
 		pd->state = OSDP_PD_STATE_IDLE;
 		break;
 	case OSDP_PD_STATE_ERR:

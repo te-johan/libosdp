@@ -240,7 +240,7 @@ int osdp_phy_decode_packet(struct osdp_pd *pd, uint8_t *buf, int len)
 {
 	uint8_t *data, *mac, *buf_start = buf;
 	uint16_t comp, cur;
-	int pkt_len, pd_mode, pd_addr, mac_offset, is_cmd;
+	int pkt_len, pkt_len_full, pd_mode, pd_addr, mac_offset, is_cmd;
 	struct osdp_packet_header *pkt;
 
 	/* wait till we have the header */
@@ -274,11 +274,15 @@ int osdp_phy_decode_packet(struct osdp_pd *pd, uint8_t *buf, int len)
 
 	/* validate packet length */
 	pkt_len = (pkt->len_msb << 8) | pkt->len_lsb;
-	if (pkt_len != len) {
+	if (pkt_len > len) {
 		/* wait for more data? */
 		return OSDP_ERR_PKT_WAIT;
 	}
-
+#ifndef CONFIG_OSDP_SKIP_MARK_BYTE
+	pkt_len_full = pkt_len + 1;
+#else
+	pkt_len_full = pkt_len;
+#endif
 	/* validate PD address */
 	pd_addr = pkt->pd_address & 0x7F;
 	if (pd_addr != pd->address && pd_addr != 0x7F) {
@@ -287,6 +291,11 @@ int osdp_phy_decode_packet(struct osdp_pd *pd, uint8_t *buf, int len)
 			LOG_ERR(TAG "invalid pd address %d", pd_addr);
 			return OSDP_ERR_PKT_FMT;
 		}
+#ifndef CONFIG_OSDP_SKIP_MARK_BYTE
+		pd->rx_buf_len -= pkt_len + 1;
+#else
+		pd->rx_buf_len -= pkt_len;
+#endif
 		return OSDP_ERR_PKT_SKIP;
 	}
 
@@ -320,7 +329,6 @@ int osdp_phy_decode_packet(struct osdp_pd *pd, uint8_t *buf, int len)
 		pd->ephemeral_data[0] = OSDP_PD_NAK_SEQ_NUM;
 		return OSDP_ERR_PKT_FMT;
 	}
-	len -= sizeof(struct osdp_packet_header); /* consume header */
 
 	/* validate CRC/checksum */
 	if (pkt->control & PKT_CONTROL_CRC) {
@@ -333,19 +341,20 @@ int osdp_phy_decode_packet(struct osdp_pd *pd, uint8_t *buf, int len)
 			return OSDP_ERR_PKT_FMT;
 		}
 		mac_offset = pkt_len - 4 - 2;
-		len -= 2; /* consume CRC */
+		pkt_len -= 2; /* consume CRC */
 	} else {
 		comp = osdp_compute_checksum(buf, pkt_len - 1);
-		if (comp != buf[len - 1]) {
+		if (comp != buf[pkt_len - 1]) {
 			LOG_ERR(TAG "invalid checksum %02x/%02x", comp, cur);
 			pd->reply_id = REPLY_NAK;
 			pd->ephemeral_data[0] = OSDP_PD_NAK_MSG_CHK;
 			return OSDP_ERR_PKT_FMT;
 		}
 		mac_offset = pkt_len - 4 - 1;
-		len -= 1; /* consume checksum */
+		pkt_len -= 1; /* consume checksum */
 	}
 
+	pkt_len -= sizeof(struct osdp_packet_header); /* consume header */
 	data = pkt->data;
 
 	if (pkt->control & PKT_CONTROL_SCB) {
@@ -375,7 +384,7 @@ int osdp_phy_decode_packet(struct osdp_pd *pd, uint8_t *buf, int len)
 			}
 		}
 		data = pkt->data + pkt->data[0];
-		len -= pkt->data[0]; /* consume security block */
+		pkt_len -= pkt->data[0]; /* consume security block */
 	} else {
 		if (ISSET_FLAG(pd, PD_FLAG_SC_ACTIVE)) {
 			LOG_ERR(TAG "Received plain-text message in SC");
@@ -399,7 +408,7 @@ int osdp_phy_decode_packet(struct osdp_pd *pd, uint8_t *buf, int len)
 			pd->ephemeral_data[0] = OSDP_PD_NAK_SC_COND;
 			return OSDP_ERR_PKT_FMT;
 		}
-		len -= 4; /* consume MAC */
+		pkt_len -= 4; /* consume MAC */
 
 		/* decrypt data block */
 		if (pkt->data[1] == SCS_17 || pkt->data[1] == SCS_18) {
@@ -413,20 +422,22 @@ int osdp_phy_decode_packet(struct osdp_pd *pd, uint8_t *buf, int len)
 			 * already consumed. So we can just skip the cmd/reply
 			 * ID (data[0])  when calling osdp_decrypt_data().
 			 */
-			len = osdp_decrypt_data(pd, is_cmd, data + 1, len - 1);
-			if (len <= 0) {
+			pkt_len = osdp_decrypt_data(pd, is_cmd, data + 1, pkt_len - 1);
+			if (pkt_len <= 0) {
 				LOG_ERR(TAG "failed at decrypt; discarding SC");
 				CLEAR_FLAG(pd, PD_FLAG_SC_ACTIVE);
 				pd->reply_id = REPLY_NAK;
 				pd->ephemeral_data[0] = OSDP_PD_NAK_SC_COND;
 				return OSDP_ERR_PKT_FMT;
 			}
-			len += 1; /* put back cmd/reply ID */
+			pkt_len += 1; /* put back cmd/reply ID */
 		}
 	}
 
-	memmove(buf_start, data, len);
-	return len;
+	memcpy(pd->data_buf, data, pkt_len);
+	memmove(buf_start, buf_start + pkt_len_full, len + 1/*fixme*/ - pkt_len_full);
+	pd->rx_buf_len -= pkt_len_full;
+	return pkt_len;
 }
 
 void osdp_phy_state_reset(struct osdp_pd *pd)

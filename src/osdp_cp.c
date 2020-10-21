@@ -688,16 +688,15 @@ static int cp_process_reply(struct osdp_pd *pd)
 	if (ret == OSDP_ERR_PKT_FMT) {
 		return OSDP_CP_ERR_GENERIC;
 	} else if (ret == OSDP_ERR_PKT_WAIT) {
-		/* rx_buf_len != pkt->len; wait for more data */
+		/* rx_buf_len < pkt->len; wait for more data */
 		return OSDP_CP_ERR_NO_DATA;
 	} else if (ret == OSDP_ERR_PKT_SKIP) {
 		/* soft fail - discard this message */
-		pd->rx_buf_len = 0;
 		return OSDP_CP_ERR_NO_DATA;
 	}
-	pd->rx_buf_len = ret;
+	pd->data_buf_len = ret;
 
-	return cp_decode_response(pd, pd->rx_buf, pd->rx_buf_len);
+	return cp_decode_response(pd, pd->data_buf, pd->data_buf_len);
 }
 
 static void cp_flush_command_queue(struct osdp_pd *pd)

@@ -286,6 +286,8 @@ struct osdp_pd {
 	int64_t sc_tstamp;
 	uint8_t rx_buf[OSDP_PACKET_BUF_SIZE];
 	int rx_buf_len;
+	uint8_t data_buf[OSDP_PACKET_BUF_SIZE];
+	int data_buf_len;
 	int64_t phy_tstamp;
 
 	int cmd_id;
